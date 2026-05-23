@@ -1,10 +1,306 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
-<head>
+<html lang="pt-BR"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              window.parent.postMessage({
+                type: 'screenshotData',
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Proposta VeM — CRM + Notion</title>
-<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400&amp;family=DM+Sans:wght@300;400;500&amp;display=swap" rel="stylesheet">
 <style>
   :root {
     --cream: #F5F0E8;
@@ -172,9 +468,9 @@
   .cover-right::before {
     content: 'VeM';
     position: absolute;
-    top: -20px; right: -30px;
+    top: 40px; right: 32px;
     font-family: 'Cormorant Garamond', serif;
-    font-size: 220px;
+    font-size: 140px;
     font-weight: 300;
     color: rgba(255,255,255,0.06);
     line-height: 1;
@@ -592,6 +888,50 @@
   .slide-dark .styled-list li:first-child { border-color: rgba(245,240,232,0.1); }
   .slide-dark .accent-line { background: rgba(245,240,232,0.2); }
 
+
+
+  /* CONTACT FIELDS - always editable */
+  .contact-field[contenteditable] {
+    outline: none;
+    cursor: text;
+    transition: border-color 0.2s, opacity 0.2s;
+  }
+  .contact-field[contenteditable]:hover { opacity: 0.85; }
+  .contact-field[contenteditable]:focus {
+    border-bottom: 1px solid rgba(245,240,232,0.5) !important;
+    opacity: 1;
+  }
+  /* Also always add contact-field to EDITABLE even outside edit mode */
+
+  /* EDIT TOOLBAR */
+  .edit-toolbar {
+    position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%);
+    z-index: 200; display: flex; gap: 8px; align-items: center;
+    background: var(--ink); border: 1px solid rgba(255,255,255,0.12);
+    padding: 10px 16px; border-radius: 100px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.35); font-family: DM Sans,sans-serif;
+  }
+  .edit-toolbar button {
+    background: none; border: none; cursor: pointer; font-family: DM Sans,sans-serif;
+    font-size: 12px; letter-spacing: 0.08em; padding: 7px 16px;
+    border-radius: 100px; transition: all 0.2s; font-weight: 500;
+  }
+  .btn-edit { color: rgba(245,240,232,0.6); }
+  .btn-edit:hover { color: var(--cream) !important; background: rgba(255,255,255,0.08) !important; }
+  .btn-edit.active { background: var(--terracotta) !important; color: var(--cream) !important; }
+  .btn-save { color: rgba(245,240,232,0.85); background: rgba(255,255,255,0.08); }
+  .btn-save:hover { background: rgba(255,255,255,0.16) !important; }
+  .toolbar-divider { width: 1px; height: 18px; background: rgba(255,255,255,0.12); flex-shrink:0; }
+  .toolbar-label { font-size: 11px; letter-spacing: 0.12em; color: rgba(245,240,232,0.3); text-transform: uppercase; padding: 0 4px; user-select: none; }
+  .edit-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--terracotta); display: none; animation: blink 1.5s infinite; }
+  body. .edit-dot { display: block; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  body. [contenteditable] { outline: none; border-radius: 2px; cursor: text; transition: background 0.15s, box-shadow 0.15s; }
+  body. [contenteditable]:hover { background: rgba(181,113,74,0.12) !important; box-shadow: 0 0 0 2px rgba(181,113,74,0.35); }
+  body. [contenteditable]:focus { background: rgba(181,113,74,0.18) !important; box-shadow: 0 0 0 2px var(--terracotta); }
+  body. .slide-dark [contenteditable]:hover, body. .cover [contenteditable]:hover { background: rgba(255,255,255,0.09) !important; box-shadow: 0 0 0 2px rgba(255,255,255,0.25); }
+  body. .slide-dark [contenteditable]:focus, body. .cover [contenteditable]:focus { background: rgba(255,255,255,0.13) !important; box-shadow: 0 0 0 2px rgba(255,255,255,0.5); }
+
   /* FOOTER */
   footer {
     background: var(--ink);
@@ -615,32 +955,32 @@
   }
 </style>
 </head>
-<body>
+<body id="artifacts-component-root-html" class="">
 
 <!-- NAV -->
 <nav class="nav">
   <div class="nav-logo">Vidas em Movimento</div>
-  <div class="nav-dots" id="navDots"></div>
+  <div class="nav-dots" id="navDots"><button class="nav-dot" aria-label="Slide 1"></button><button class="nav-dot" aria-label="Slide 2"></button><button class="nav-dot" aria-label="Slide 3"></button><button class="nav-dot" aria-label="Slide 4"></button><button class="nav-dot" aria-label="Slide 5"></button><button class="nav-dot" aria-label="Slide 6"></button><button class="nav-dot" aria-label="Slide 7"></button><button class="nav-dot" aria-label="Slide 8"></button><button class="nav-dot" aria-label="Slide 9"></button><button class="nav-dot" aria-label="Slide 10"></button><button class="nav-dot" aria-label="Slide 11"></button><button class="nav-dot active" aria-label="Slide 12"></button></div>
 </nav>
 
 <!-- SLIDE 0: CAPA -->
-<section class="slide cover" id="slide-0">
+<section class="slide cover visible" id="slide-0">
   <div class="cover-left">
     <div>
-      <div class="cover-meta">Proposta Comercial · 2025</div>
-      <h1>Organize.<br>Automatize.<br>Escale.</h1>
-      <div class="cover-tagline">Implantação de CRM Inteligente<br>+ Estrutura Organizacional Notion</div>
+      <div class="cover-meta" spellcheck="false">Proposta Comercial · 2026</div>
+      <h1 spellcheck="false">Organize.<br>Automatize.<br>Escale.</h1>
+      <div class="cover-tagline" spellcheck="false">Implantação de CRM Inteligente<br>+ Estrutura Organizacional Notion</div>
     </div>
     <div>
-      <div class="cover-detail">
-        <strong>Para:</strong> Vidas em Movimento (VeM)<br>
-        <strong>Apresentado por:</strong> [Seu Nome / Agência]<br>
-        <strong>Data:</strong> Maio de 2025
+      <div class="cover-detail" spellcheck="false">
+        <strong>Para:</strong>&nbsp;VeM | Vidas em Movimento<br>
+        <strong>Apresentado por:</strong>&nbsp;Nowhere Office<br>
+        <strong>Data:</strong> Maio de 2026
       </div>
     </div>
   </div>
   <div class="cover-right">
-    <div class="cover-detail" style="position:relative;z-index:1;">
+    <div class="cover-detail" style="position:relative;z-index:1;" spellcheck="false">
       <div class="label" style="color:rgba(245,240,232,0.4);margin-bottom:24px;">O que está nesta proposta</div>
       <div style="display:flex;flex-direction:column;gap:16px;">
         <div style="display:flex;gap:12px;align-items:center;">
@@ -669,13 +1009,13 @@
 </section>
 
 <!-- SLIDE 1: O CENÁRIO ATUAL -->
-<section class="slide" id="slide-1">
+<section class="slide visible" id="slide-1">
   <div class="slide-inner">
     <div class="slide-num">01 &nbsp; Diagnóstico</div>
-    <h2>Onde a VeM<br>está hoje</h2>
+    <h2 spellcheck="false">Onde a VeM<br>está hoje</h2>
     <div class="accent-line"></div>
     <div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;margin-bottom:8px;">
-      <p class="body-text" style="max-width:500px;">A VeM já tem produto, presença e identidade — destinos como Bali, Equador e Lençóis Maranhenses, guias de referência e um nicho altamente específico. O que falta é a estrutura para capturar e converter o interesse que já existe.</p>
+      <p class="body-text" style="max-width:500px;" spellcheck="false">A VeM já tem produto, presença e identidade — destinos como Bali, Equador e Lençóis Maranhenses, guias de referência e um nicho altamente específico. O que falta é a estrutura para capturar e converter o interesse que já existe.</p>
       <div style="display:flex;flex-direction:column;gap:8px;min-width:180px;">
         <div style="padding:16px 20px;border:1px solid var(--border);background:var(--warm-white);">
           <div style="font-family:'Cormorant Garamond',serif;font-size:36px;font-weight:300;color:var(--terracotta);line-height:1;">1.768</div>
@@ -689,105 +1029,105 @@
     </div>
     <ul class="styled-list">
       <li>
-        <div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div>
-        <span>Leads chegando pelo Instagram e WhatsApp sem centralização — quem perguntou sobre Bali ontem está onde hoje?</span>
+        <div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div>
+        <span spellcheck="false">Leads chegando pelo Instagram e WhatsApp sem centralização — quem perguntou sobre Bali ontem está onde hoje?</span>
       </li>
       <li>
-        <div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div>
-        <span>Time pequeno sobrecarregado com operação manual: gestão de guias, inscrições, logística — tudo na memória ou no WhatsApp</span>
+        <div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div>
+        <span spellcheck="false">Time pequeno sobrecarregado com operação manual: gestão de guias, inscrições, logística — tudo na memória ou no WhatsApp</span>
       </li>
       <li>
-        <div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div>
-        <span>Crescimento orgânico acontecendo, mas sem rastreamento de onde vêm os clientes ou o que os convenceu a fechar</span>
+        <div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div>
+        <span spellcheck="false">Crescimento orgânico acontecendo, mas sem rastreamento de onde vêm os clientes ou o que os convenceu a fechar</span>
       </li>
       <li>
-        <div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div>
-        <span>Conteúdo de qualidade publicado sem dados: qual post gerou mais pedidos de orçamento? Equador ou Alter do Chão?</span>
+        <div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div>
+        <span spellcheck="false">Conteúdo de qualidade publicado sem dados: qual post gerou mais pedidos de orçamento? Equador ou Alter do Chão?</span>
       </li>
       <li>
-        <div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div>
-        <span>Parceiros como Rafa Grillo, Marina Bergmann e Eric Zadumbide gerenciados sem sistema — contratos, histórico e contatos dispersos</span>
+        <div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div>
+        <span spellcheck="false">Parceiros como Rafa Grillo, Marina Bergmann e Eric Zadumbide gerenciados sem sistema — contratos, histórico e contatos dispersos</span>
       </li>
     </ul>
   </div>
 </section>
 
 <!-- SLIDE 2: O QUE ISSO CUSTA -->
-<section class="slide slide-dark" id="slide-2">
+<section class="slide slide-dark visible" id="slide-2">
   <div class="slide-inner">
     <div class="slide-num">02 &nbsp; Impacto</div>
-    <h2>O que a falta<br>de estrutura custa</h2>
+    <h2 spellcheck="false">O que a falta<br>de estrutura custa</h2>
     <div class="accent-line"></div>
     <div class="three-col">
       <div>
-        <div class="result-num" style="color:rgba(245,240,232,0.2);">01</div>
+        <div class="result-num" style="color:rgba(245,240,232,0.2);" spellcheck="false">01</div>
         <div class="accent-line" style="background:var(--terracotta);width:24px;"></div>
-        <h3 style="color:var(--cream);font-size:18px;">Leads perdidos</h3>
-        <p class="body-text" style="font-size:13px;">Contatos quentes que chegam, ficam sem follow-up e esfriam. Oportunidades de venda de viagens internacionais não convertidas.</p>
+        <h3 style="color:var(--cream);font-size:18px;" spellcheck="false">Leads perdidos</h3>
+        <p class="body-text" style="font-size:13px;" spellcheck="false">Contatos quentes que chegam, ficam sem follow-up e esfriam. Oportunidades de venda de viagens internacionais não convertidas.</p>
       </div>
       <div>
-        <div class="result-num" style="color:rgba(245,240,232,0.2);">02</div>
+        <div class="result-num" style="color:rgba(245,240,232,0.2);" spellcheck="false">02</div>
         <div class="accent-line" style="background:var(--terracotta);width:24px;"></div>
-        <h3 style="color:var(--cream);font-size:18px;">Tempo gasto em operação</h3>
-        <p class="body-text" style="font-size:13px;">Energia do time investida em tarefas repetitivas e manuais — ao invés de criar, vender e se relacionar com o público.</p>
+        <h3 style="color:var(--cream);font-size:18px;" spellcheck="false">Tempo gasto em operação</h3>
+        <p class="body-text" style="font-size:13px;" spellcheck="false">Energia do time investida em tarefas repetitivas e manuais — ao invés de criar, vender e se relacionar com o público.</p>
       </div>
       <div>
-        <div class="result-num" style="color:rgba(245,240,232,0.2);">03</div>
+        <div class="result-num" style="color:rgba(245,240,232,0.2);" spellcheck="false">03</div>
         <div class="accent-line" style="background:var(--terracotta);width:24px;"></div>
-        <h3 style="color:var(--cream);font-size:18px;">Conteúdo no escuro</h3>
-        <p class="body-text" style="font-size:13px;">Sem dados de comportamento do público, o conteúdo é criado por intuição — o que reduz conversões e dificulta crescimento.</p>
+        <h3 style="color:var(--cream);font-size:18px;" spellcheck="false">Conteúdo no escuro</h3>
+        <p class="body-text" style="font-size:13px;" spellcheck="false">Sem dados de comportamento do público, o conteúdo é criado por intuição — o que reduz conversões e dificulta crescimento.</p>
       </div>
     </div>
     <div class="highlight-box" style="margin-top:48px;border-color:rgba(245,240,232,0.15);background:rgba(245,240,232,0.04);">
-      <p style="color:rgba(245,240,232,0.75);">Um nicho tão específico e qualificado como o da VeM deveria converter mais. O problema não é o produto — é a falta de sistema para capturar e nutrir as oportunidades que já chegam.</p>
+      <p style="color:rgba(245,240,232,0.75);" spellcheck="false">Um nicho tão específico e qualificado como o da VeM deveria converter mais. O problema não é o produto — é a falta de sistema para capturar e nutrir as oportunidades que já chegam.</p>
     </div>
   </div>
 </section>
 
 <!-- SLIDE 3: SOLUÇÃO CRM -->
-<section class="slide" id="slide-3">
+<section class="slide visible" id="slide-3">
   <div class="slide-inner">
     <div class="slide-num">03 &nbsp; Solução</div>
-    <h2>CRM Inteligente<br>com Tomik</h2>
+    <h2 spellcheck="false">CRM Inteligente<br>com Tomik</h2>
     <div class="accent-line"></div>
     <div class="two-col">
       <div>
-        <p class="body-text">O Tomik é um hub de gestão inteligente com agentes de IA — pensado para negócios que precisam organizar leads, automatizar comunicação e gerar dados sem contratar um time maior.</p>
-        <p class="body-text" style="margin-top:16px;">Para a VeM, isso significa ter visibilidade total de cada lead desde o primeiro contato até a conversão em viagem.</p>
+        <p class="body-text" spellcheck="false">O Tomik é um hub de gestão inteligente com agentes de IA — pensado para negócios que precisam organizar leads, automatizar comunicação e gerar dados sem contratar um time maior.</p>
+        <p class="body-text" style="margin-top:16px;" spellcheck="false">Para a VeM, isso significa ter visibilidade total de cada lead desde o primeiro contato até a conversão em viagem.</p>
         <div style="margin-top:32px;">
-          <div class="pill pill-dark">Agentes de IA</div>
-          <div class="pill pill-dark">Integração WhatsApp</div>
+          <div class="pill pill-dark">API Oficial WhatsApp</div>
+          <div class="pill pill-dark">Agentes de IA internos</div>
+          <div class="pill pill-dark">Multiatendente</div>
           <div class="pill pill-dark">Pipeline visual</div>
-          <div class="pill pill-dark">Dashboard em tempo real</div>
-          <div class="pill pill-dark">Automações</div>
+          <div class="pill pill-dark">MCP Tools</div>
+          <div class="pill pill-dark">Ativação em 1 dia</div>
         </div>
       </div>
       <div style="display:flex;flex-direction:column;gap:16px;">
         <div class="card">
           <div class="card-number">01</div>
-          <h3>Centralização</h3>
-          <p class="body-text" style="font-size:13px;">Todos os leads de Instagram, WhatsApp e site em um único lugar. Sem informação espalhada.</p>
+          <h3>API Oficial WhatsApp + Chat ao vivo</h3>
+          <p class="body-text" style="font-size:13px;">WhatsApp oficial integrado ao CRM. O time responde com contexto completo do lead — histórico, etapa do funil e janela ativa — na mesma tela.</p>
         </div>
         <div class="card">
           <div class="card-number">02</div>
-          <h3>Qualificação automática</h3>
-          <p class="body-text" style="font-size:13px;">Agente de IA triagem e qualifica leads automaticamente. O time foca nos contatos certos.</p>
+          <h3>Agentes de IA internos</h3>
+          <p class="body-text" style="font-size:13px;">Agentes que qualificam, movem leads no funil, agendam follow-ups e apoiam o time. Ação real no CRM — não apenas respostas automáticas.</p>
         </div>
         <div class="card">
           <div class="card-number">03</div>
-          <h3>Dados e inteligência</h3>
-          <p class="body-text" style="font-size:13px;">Relatórios em tempo real sobre comportamento, interesse e perfil da audiência da VeM.</p>
+          <h3>Painel de performance</h3>
+          <p class="body-text" style="font-size:13px;">Funil em tempo real, taxa IA × humano, SLA de resposta e automações ativas. Dados para otimizar e provar resultado semana a semana.</p>
         </div>
       </div>
-    </div>
   </div>
 </section>
 
 <!-- SLIDE 4: COMO FUNCIONA O CRM -->
-<section class="slide" id="slide-4">
+<section class="slide visible" id="slide-4">
   <div class="slide-inner">
     <div class="slide-num">04 &nbsp; CRM na prática</div>
-    <h2>Como o Tomik<br>funciona para a VeM</h2>
+    <h2 spellcheck="false">Como o Tomik<br>funciona para a VeM</h2>
     <div class="accent-line"></div>
     <div class="two-col" style="align-items:start;">
       <div>
@@ -795,33 +1135,33 @@
           <div class="timeline-item">
             <div class="timeline-dot"></div>
             <div>
-              <div class="timeline-step">Entrada</div>
-              <div class="timeline-title">Captura de leads</div>
-              <div class="timeline-body">Instagram, WhatsApp e site capturam leads automaticamente no CRM. Nenhum contato se perde.</div>
+              <div class="timeline-step" spellcheck="false">Entrada</div>
+              <div class="timeline-title" spellcheck="false">Captura de leads</div>
+              <div class="timeline-body" spellcheck="false">Instagram, WhatsApp e site capturam leads automaticamente no CRM. Nenhum contato se perde.</div>
             </div>
           </div>
           <div class="timeline-item">
             <div class="timeline-dot"></div>
             <div>
-              <div class="timeline-step">Qualificação</div>
-              <div class="timeline-title">Agente de IA em ação</div>
-              <div class="timeline-body">O agente identifica o interesse do lead (tipo de viagem, destino, perfil) e o posiciona no funil correto.</div>
+              <div class="timeline-step" spellcheck="false">Qualificação</div>
+              <div class="timeline-title" spellcheck="false">Agente de IA em ação</div>
+              <div class="timeline-body" spellcheck="false">O agente identifica o interesse do lead (tipo de viagem, destino, perfil) e o posiciona no funil correto.</div>
             </div>
           </div>
           <div class="timeline-item">
             <div class="timeline-dot"></div>
             <div>
-              <div class="timeline-step">Nutrição</div>
-              <div class="timeline-title">Follow-up automático</div>
-              <div class="timeline-body">Lembretes, mensagens e notificações automáticas para o time de vendas. Zero lead esquecido.</div>
+              <div class="timeline-step" spellcheck="false">Nutrição</div>
+              <div class="timeline-title" spellcheck="false">Follow-up automático</div>
+              <div class="timeline-body" spellcheck="false">Lembretes, mensagens e notificações automáticas para o time de vendas. Zero lead esquecido.</div>
             </div>
           </div>
           <div class="timeline-item">
             <div class="timeline-dot"></div>
             <div>
-              <div class="timeline-step">Dados</div>
-              <div class="timeline-title">Dashboard em tempo real</div>
-              <div class="timeline-body">Visão completa: taxa de conversão, destinos mais buscados, perfil do público e performance de vendas.</div>
+              <div class="timeline-step" spellcheck="false">Dados</div>
+              <div class="timeline-title" spellcheck="false">Dashboard em tempo real</div>
+              <div class="timeline-body" spellcheck="false">Visão completa: taxa de conversão, destinos mais buscados, perfil do público e performance de vendas.</div>
             </div>
           </div>
         </div>
@@ -831,11 +1171,11 @@
           <div>
             <div class="label" style="color:rgba(245,240,232,0.5);margin-bottom:24px;">Funil personalizado para viagens</div>
             <div style="display:flex;flex-direction:column;gap:12px;">
-              <div style="padding:12px 16px;background:rgba(255,255,255,0.1);font-size:13px;color:rgba(245,240,232,0.85);font-weight:300;">🟢 &nbsp;Lead captado — "quero saber sobre Bali"</div>
-              <div style="padding:12px 16px;background:rgba(255,255,255,0.08);font-size:13px;color:rgba(245,240,232,0.75);font-weight:300;">🔵 &nbsp;IA qualifica — perfil, destino, data</div>
-              <div style="padding:12px 16px;background:rgba(255,255,255,0.08);font-size:13px;color:rgba(245,240,232,0.75);font-weight:300;">🟡 &nbsp;Proposta enviada automaticamente</div>
-              <div style="padding:12px 16px;background:rgba(255,255,255,0.08);font-size:13px;color:rgba(245,240,232,0.75);font-weight:300;">🟠 &nbsp;Follow-up agendado pelo CRM</div>
-              <div style="padding:12px 16px;background:rgba(255,255,255,0.15);font-size:13px;color:rgba(245,240,232,0.95);font-weight:400;">✅ &nbsp;Viagem confirmada — Yoga & Surf Trip</div>
+              <div class="funnel-step" style="padding:12px 16px;background:rgba(255,255,255,0.1);font-size:13px;color:rgba(245,240,232,0.85);font-weight:300;" spellcheck="false">🟢 &nbsp;Lead captado — "quero saber sobre Bali"</div>
+              <div class="funnel-step" style="padding:12px 16px;background:rgba(255,255,255,0.08);font-size:13px;color:rgba(245,240,232,0.75);font-weight:300;" spellcheck="false">🔵 &nbsp;IA qualifica — perfil, destino, data</div>
+              <div class="funnel-step" style="padding:12px 16px;background:rgba(255,255,255,0.08);font-size:13px;color:rgba(245,240,232,0.75);font-weight:300;" spellcheck="false">🟡 &nbsp;Proposta enviada automaticamente</div>
+              <div class="funnel-step" style="padding:12px 16px;background:rgba(255,255,255,0.08);font-size:13px;color:rgba(245,240,232,0.75);font-weight:300;" spellcheck="false">🟠 &nbsp;Follow-up agendado pelo CRM</div>
+              <div class="funnel-step" style="padding:12px 16px;background:rgba(255,255,255,0.15);font-size:13px;color:rgba(245,240,232,0.95);font-weight:400;" spellcheck="false">✅ &nbsp;Viagem confirmada — Yoga &amp; Surf Trip</div>
             </div>
           </div>
           <div style="margin-top:32px;padding-top:24px;border-top:1px solid rgba(255,255,255,0.15);">
@@ -849,34 +1189,34 @@
 </section>
 
 <!-- SLIDE 5: CONTEÚDO COM DADOS -->
-<section class="slide" id="slide-5">
+<section class="slide visible" id="slide-5">
   <div class="slide-inner">
     <div class="slide-num">05 &nbsp; Estratégia de conteúdo</div>
-    <h2>Conteúdo que vende,<br>não só que engaja</h2>
+    <h2 spellcheck="false">Conteúdo que vende,<br>não só que engaja</h2>
     <div class="accent-line"></div>
-    <p class="body-text" style="max-width:560px;">Com o CRM ativo, a VeM passa a criar conteúdo baseado em dados reais do seu próprio público — não em suposições ou tendências genéricas.</p>
+    <p class="body-text" style="max-width:560px;" spellcheck="false">Com o CRM ativo, a VeM passa a criar conteúdo baseado em dados reais do seu próprio público — não em suposições ou tendências genéricas.</p>
     <div class="two-col" style="margin-top:40px;align-items:start;">
       <div>
         <div class="label" style="margin-bottom:20px;">O que o CRM revela</div>
         <ul class="styled-list">
-          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Quais destinos geram mais interesse e pedidos de orçamento</span></li>
-          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Quais formatos de viagem convertem melhor (retiro, travessia, esporte)</span></li>
-          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Em que momento do funil o lead abandona — e por quê</span></li>
-          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Perfil real de quem compra: especialidade médica, cidade, faixa etária</span></li>
-          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Sazonalidade das buscas — quando planejar campanhas e lançamentos</span></li>
+          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Quais destinos geram mais interesse e pedidos de orçamento</span></li>
+          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Quais formatos de viagem convertem melhor (retiro, travessia, esporte)</span></li>
+          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Em que momento do funil o lead abandona — e por quê</span></li>
+          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Perfil real de quem compra: especialidade médica, cidade, faixa etária</span></li>
+          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Sazonalidade das buscas — quando planejar campanhas e lançamentos</span></li>
         </ul>
       </div>
       <div style="display:flex;flex-direction:column;gap:16px;">
         <div class="card" style="border-left:3px solid var(--sage);">
           <div class="label" style="color:var(--sage);margin-bottom:8px;">Antes do CRM</div>
-          <p class="body-text" style="font-size:13px;">"Vamos postar sobre Bali porque parece que o público gostou do último post…"</p>
+          <p class="body-text" style="font-size:13px;" spellcheck="false">"Vamos postar sobre Bali porque parece que o público gostou do último post…"</p>
         </div>
         <div class="card" style="border-left:3px solid var(--terracotta);">
           <div class="label" style="color:var(--terracotta);margin-bottom:8px;">Com o CRM</div>
-          <p class="body-text" style="font-size:13px;">"68% dos leads do último mês perguntaram sobre Lençóis Maranhenses. Vamos lançar a Yoga & Trekking Trip com campanha direcionada."</p>
+          <p class="body-text" style="font-size:13px;" spellcheck="false">"68% dos leads do último mês perguntaram sobre Lençóis Maranhenses. Vamos lançar a Yoga &amp; Trekking Trip com campanha direcionada."</p>
         </div>
         <div class="highlight-box" style="margin-top:0;">
-          <p style="font-size:16px;">Menos achismo.<br>Mais estratégia.</p>
+          <p style="font-size:16px;" spellcheck="false">Menos achismo.<br>Mais estratégia.</p>
         </div>
       </div>
     </div>
@@ -884,133 +1224,133 @@
 </section>
 
 <!-- SLIDE 6: NOTION -->
-<section class="slide" id="slide-6">
+<section class="slide visible" id="slide-6">
   <div class="slide-inner">
     <div class="slide-num">06 &nbsp; Estrutura Interna</div>
-    <h2>Notion:<br>o sistema nervoso<br>da VeM</h2>
+    <h2 spellcheck="false">Notion:<br>o sistema nervoso<br>da VeM</h2>
     <div class="accent-line"></div>
-    <p class="body-text" style="max-width:560px;">Além do CRM, a VeM precisa de uma estrutura interna para operar com clareza. O Notion resolve isso — um workspace completo, construído sob medida, pronto para usar em até 14 dias.</p>
+    <p class="body-text" style="max-width:560px;" spellcheck="false">Além do CRM, a VeM precisa de uma estrutura interna para operar com clareza. O Notion resolve isso — um workspace completo, construído sob medida, pronto para usar em até 30 dias.</p>
     <div class="three-col" style="margin-top:40px;">
       <div class="card">
         <div style="font-size:24px;margin-bottom:12px;">🏠</div>
-        <h3 style="font-size:16px;">Hub Central</h3>
-        <p class="body-text" style="font-size:13px;">Visão geral do negócio. Todos os módulos conectados em um painel único.</p>
+        <h3 style="font-size:16px;" spellcheck="false">Hub Central</h3>
+        <p class="body-text" style="font-size:13px;" spellcheck="false">Visão geral do negócio. Todos os módulos conectados em um painel único.</p>
       </div>
       <div class="card">
         <div style="font-size:24px;margin-bottom:12px;">📅</div>
-        <h3 style="font-size:16px;">Calendário Editorial</h3>
-        <p class="body-text" style="font-size:13px;">Planejamento de posts, vídeos e campanhas com responsáveis e status.</p>
+        <h3 style="font-size:16px;" spellcheck="false">Calendário Editorial</h3>
+        <p class="body-text" style="font-size:13px;" spellcheck="false">Planejamento de posts, vídeos e campanhas com responsáveis e status.</p>
       </div>
       <div class="card">
         <div style="font-size:24px;margin-bottom:12px;">🧗</div>
-        <h3 style="font-size:16px;">Gestão de Viagens</h3>
-        <p class="body-text" style="font-size:13px;">Bali, Equador, Alter do Chão — roteiros, inscrições, logística e status de cada experiência, tudo em um lugar.</p>
+        <h3 style="font-size:16px;" spellcheck="false">Gestão de Viagens</h3>
+        <p class="body-text" style="font-size:13px;" spellcheck="false">Bali, Equador, Alter do Chão — roteiros, inscrições, logística e status de cada experiência, tudo em um lugar.</p>
       </div>
       <div class="card">
         <div style="font-size:24px;margin-bottom:12px;">🤝</div>
-        <h3 style="font-size:16px;">Banco de Parceiros</h3>
-        <p class="body-text" style="font-size:13px;">Rafa Grillo, Marina Bergmann, Eric Zadumbide e outros guias — contratos, contatos e histórico de viagens organizados.</p>
+        <h3 style="font-size:16px;" spellcheck="false">Banco de Parceiros</h3>
+        <p class="body-text" style="font-size:13px;" spellcheck="false">Rafa Grillo, Marina Bergmann, Eric Zadumbide e outros guias — contratos, contatos e histórico de viagens organizados.</p>
       </div>
       <div class="card">
         <div style="font-size:24px;margin-bottom:12px;">📊</div>
-        <h3 style="font-size:16px;">Pipeline de Vendas</h3>
-        <p class="body-text" style="font-size:13px;">Espelho macro do CRM para visão estratégica do negócio.</p>
+        <h3 style="font-size:16px;" spellcheck="false">Pipeline de Vendas</h3>
+        <p class="body-text" style="font-size:13px;" spellcheck="false">Espelho macro do CRM para visão estratégica do negócio.</p>
       </div>
       <div class="card">
         <div style="font-size:24px;margin-bottom:12px;">✅</div>
-        <h3 style="font-size:16px;">Tarefas e Projetos</h3>
-        <p class="body-text" style="font-size:13px;">Gestão do time com responsáveis, prazos e prioridades claras.</p>
+        <h3 style="font-size:16px;" spellcheck="false">Tarefas e Projetos</h3>
+        <p class="body-text" style="font-size:13px;" spellcheck="false">Gestão do time com responsáveis, prazos e prioridades claras.</p>
       </div>
     </div>
   </div>
 </section>
 
 <!-- SLIDE 7: DIFERENCIAL NOTION -->
-<section class="slide" id="slide-7">
+<section class="slide visible" id="slide-7">
   <div class="slide-inner">
     <div class="slide-num">07 &nbsp; Por que personalizado</div>
-    <h2>A diferença de ter<br>um sistema feito<br><em>para você</em></h2>
+    <h2 spellcheck="false">A diferença de ter<br>um sistema feito<br><em>para você</em></h2>
     <div class="accent-line"></div>
     <table class="compare-table">
       <thead>
         <tr>
-          <th>Aspecto</th>
-          <th>Fazer sozinho</th>
-          <th>Template genérico</th>
-          <th>Implementação personalizada</th>
+          <th spellcheck="false">Aspecto</th>
+          <th spellcheck="false">Fazer sozinho</th>
+          <th spellcheck="false">Template genérico</th>
+          <th spellcheck="false">Implementação personalizada</th>
         </tr>
       </thead>
       <tbody>
         <tr>
-          <td>Tempo de entrega</td>
-          <td>Semanas ou meses</td>
-          <td>Minutos (mas não resolve)</td>
-          <td>Até 14 dias, pronto para usar</td>
+          <td spellcheck="false">Tempo de entrega</td>
+          <td spellcheck="false">Semanas ou meses</td>
+          <td spellcheck="false">Minutos (mas não resolve)</td>
+          <td spellcheck="false">Até 30 dias, pronto para usar</td>
         </tr>
         <tr>
-          <td>Adequação ao negócio</td>
-          <td>Alta curva de aprendizado</td>
-          <td>Adaptação forçada</td>
-          <td>Feito sob medida para a VeM</td>
+          <td spellcheck="false">Adequação ao negócio</td>
+          <td spellcheck="false">Alta curva de aprendizado</td>
+          <td spellcheck="false">Adaptação forçada</td>
+          <td spellcheck="false">Feito sob medida para a VeM</td>
         </tr>
         <tr>
-          <td>Resolução dos problemas</td>
-          <td>Alto risco de erro na arquitetura</td>
-          <td>Resolve ~30% do problema</td>
-          <td>Resolve 100% do escopo definido</td>
+          <td spellcheck="false">Resolução dos problemas</td>
+          <td spellcheck="false">Alto risco de erro na arquitetura</td>
+          <td spellcheck="false">Resolve ~30% do problema</td>
+          <td spellcheck="false">Resolve 100% do escopo definido</td>
         </tr>
         <tr>
-          <td>Suporte</td>
-          <td>Nenhum</td>
-          <td>FAQ genérico</td>
-          <td>Checkpoint + walkthrough + 7 dias de ajustes</td>
+          <td spellcheck="false">Suporte</td>
+          <td spellcheck="false">Nenhum</td>
+          <td spellcheck="false">FAQ genérico</td>
+          <td spellcheck="false">Checkpoint + walkthrough + 7 dias de ajustes</td>
         </tr>
         <tr>
-          <td>Documentação</td>
-          <td>Nenhuma</td>
-          <td>Genérica</td>
-          <td>Documentação do SEU sistema</td>
+          <td spellcheck="false">Documentação</td>
+          <td spellcheck="false">Nenhuma</td>
+          <td spellcheck="false">Genérica</td>
+          <td spellcheck="false">Documentação do SEU sistema</td>
         </tr>
       </tbody>
     </table>
     <div class="highlight-box" style="margin-top:32px;">
-      <p>40 horas tentando montar sozinho, a R$100/h = R$4.000 em tempo perdido. Sem contar o custo de errar e refazer.</p>
+      <p spellcheck="false">40 horas tentando montar sozinho, a R$100/h = R$4.000 em tempo perdido. Sem contar o custo de errar e refazer.</p>
     </div>
   </div>
 </section>
 
 <!-- SLIDE 8: O QUE ESTÁ INCLUÍDO -->
-<section class="slide" id="slide-8">
+<section class="slide visible" id="slide-8">
   <div class="slide-inner">
     <div class="slide-num">08 &nbsp; Entregáveis</div>
-    <h2>O que você<br>recebe</h2>
+    <h2 spellcheck="false">O que você<br>recebe</h2>
     <div class="accent-line"></div>
     <div class="two-col" style="align-items:start;">
       <div>
         <div class="label" style="margin-bottom:20px;">CRM Tomik</div>
         <ul class="styled-list">
-          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Configuração completa do CRM com integrações ativas (Instagram, WhatsApp, site)</span></li>
-          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Funil de vendas personalizado para o fluxo de viagens da VeM</span></li>
-          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Agentes de IA configurados para qualificação e triagem de leads</span></li>
-          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Automações de follow-up e notificações para o time</span></li>
-          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Dashboard com métricas em tempo real</span></li>
-          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Treinamento do time + 30 dias de suporte pós-implantação</span></li>
+          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Configuração completa do CRM com integrações ativas (Instagram, WhatsApp, site)</span></li>
+          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Funil de vendas personalizado para o fluxo de viagens da VeM</span></li>
+          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Agentes de IA configurados para qualificação e triagem de leads</span></li>
+          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Automações de follow-up e notificações para o time</span></li>
+          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Dashboard com métricas em tempo real</span></li>
+          <li><div class="list-marker"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Treinamento do time + 30 dias de suporte pós-implantação</span></li>
         </ul>
       </div>
       <div>
         <div class="label" style="margin-bottom:20px;">Notion Board</div>
         <ul class="styled-list">
-          <li><div class="list-marker" style="background:var(--sage);"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Sistema completo construído do zero no workspace da VeM</span></li>
-          <li><div class="list-marker" style="background:var(--sage);"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Databases, views, filtros, templates e automações configurados</span></li>
-          <li><div class="list-marker" style="background:var(--sage);"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Configuração visual personalizada — ícones, cores e identidade</span></li>
-          <li><div class="list-marker" style="background:var(--sage);"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Walkthrough gravado ao vivo: como usar, manter e adaptar</span></li>
-          <li><div class="list-marker" style="background:var(--sage);"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>Documentação escrita de todo o sistema</span></li>
-          <li><div class="list-marker" style="background:var(--sage);"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"/></svg></div><span>7 dias de ajustes pós-entrega incluídos</span></li>
+          <li><div class="list-marker" style="background:var(--sage);"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Sistema completo construído do zero no workspace da VeM</span></li>
+          <li><div class="list-marker" style="background:var(--sage);"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Databases, views, filtros, templates e automações configurados</span></li>
+          <li><div class="list-marker" style="background:var(--sage);"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Configuração visual personalizada — ícones, cores e identidade</span></li>
+          <li><div class="list-marker" style="background:var(--sage);"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Walkthrough gravado ao vivo: como usar, manter e adaptar</span></li>
+          <li><div class="list-marker" style="background:var(--sage);"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">Documentação escrita de todo o sistema</span></li>
+          <li><div class="list-marker" style="background:var(--sage);"><svg viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="2" fill="white"></circle></svg></div><span spellcheck="false">7 dias de ajustes pós-entrega incluídos</span></li>
         </ul>
         <div class="badge-row" style="margin-top:24px;">
-          <div class="badge">Notion Service Specialist</div>
-          <div class="badge">Notion Consulting Partner</div>
-          <div class="badge">Certified Admin</div>
+          <div class="badge" spellcheck="false">Notion Service Specialist</div>
+          <div class="badge" spellcheck="false">Notion Consulting Partner</div>
+          <div class="badge" spellcheck="false">Certified Admin</div>
         </div>
       </div>
     </div>
@@ -1018,10 +1358,10 @@
 </section>
 
 <!-- SLIDE 9: CRONOGRAMA -->
-<section class="slide" id="slide-9">
+<section class="slide visible" id="slide-9">
   <div class="slide-inner">
     <div class="slide-num">09 &nbsp; Cronograma</div>
-    <h2>De zero ao sistema<br>funcionando</h2>
+    <h2 spellcheck="false">De zero ao sistema<br>funcionando</h2>
     <div class="accent-line"></div>
     <div class="two-col" style="align-items:start;">
       <div>
@@ -1029,41 +1369,41 @@
           <div class="timeline-item">
             <div class="timeline-dot"></div>
             <div>
-              <div class="timeline-step">Semana 1</div>
-              <div class="timeline-title">Diagnóstico e kickoff</div>
-              <div class="timeline-body">Mapeamento dos canais ativos, alinhamento de escopo, definição de prioridades para CRM e Notion.</div>
+              <div class="timeline-step" spellcheck="false">Semana 1</div>
+              <div class="timeline-title" spellcheck="false">Diagnóstico e kickoff</div>
+              <div class="timeline-body" spellcheck="false">Mapeamento dos canais ativos, alinhamento de escopo, definição de prioridades para CRM e Notion.</div>
             </div>
           </div>
           <div class="timeline-item">
             <div class="timeline-dot"></div>
             <div>
-              <div class="timeline-step">Semana 2</div>
-              <div class="timeline-title">Configuração do CRM</div>
-              <div class="timeline-body">Tomik configurado e integrado com WhatsApp, Instagram e site. Funil personalizado ativo.</div>
+              <div class="timeline-step" spellcheck="false">Semana 2</div>
+              <div class="timeline-title" spellcheck="false">Configuração do CRM</div>
+              <div class="timeline-body" spellcheck="false">Tomik configurado e integrado com WhatsApp, Instagram e site. Funil personalizado ativo.</div>
             </div>
           </div>
           <div class="timeline-item">
             <div class="timeline-dot"></div>
             <div>
-              <div class="timeline-step">Semana 3</div>
-              <div class="timeline-title">Agentes de IA + treinamento</div>
-              <div class="timeline-body">Ativação dos agentes de qualificação. Treinamento do time no CRM.</div>
+              <div class="timeline-step" spellcheck="false">Semana 3</div>
+              <div class="timeline-title" spellcheck="false">Agentes de IA + treinamento</div>
+              <div class="timeline-body" spellcheck="false">Ativação dos agentes de qualificação. Treinamento do time no CRM.</div>
             </div>
           </div>
           <div class="timeline-item">
             <div class="timeline-dot"></div>
             <div>
-              <div class="timeline-step">Semana 4</div>
-              <div class="timeline-title">Construção do Notion</div>
-              <div class="timeline-body">Sistema completo construído no workspace. Checkpoint intermediário com a equipe VeM.</div>
+              <div class="timeline-step" spellcheck="false">Semana 4</div>
+              <div class="timeline-title" spellcheck="false">Construção do Notion</div>
+              <div class="timeline-body" spellcheck="false">Sistema completo construído no workspace. Checkpoint intermediário com a equipe VeM.</div>
             </div>
           </div>
           <div class="timeline-item">
             <div class="timeline-dot"></div>
             <div>
-              <div class="timeline-step">Semana 5</div>
-              <div class="timeline-title">Entrega + walkthrough</div>
-              <div class="timeline-body">Sessão ao vivo, documentação entregue e 7 dias de ajustes finos incluídos.</div>
+              <div class="timeline-step" spellcheck="false">Semana 5</div>
+              <div class="timeline-title" spellcheck="false">Entrega + walkthrough</div>
+              <div class="timeline-body" spellcheck="false">Sessão ao vivo, documentação entregue e 7 dias de ajustes finos incluídos.</div>
             </div>
           </div>
         </div>
@@ -1080,7 +1420,7 @@
         </div>
         <div class="card" style="border-left:3px solid var(--terracotta);">
           <div class="label" style="color:var(--terracotta);margin-bottom:8px;">Garantia de entrega</div>
-          <p class="body-text" style="font-size:13px;">O sistema é entregue dentro do prazo combinado. Se algo não ficou como esperado, corrigimos. O risco de não ter retorno é praticamente zero.</p>
+          <p class="body-text" style="font-size:13px;" spellcheck="false">O sistema é entregue dentro do prazo combinado. Se algo não ficou como esperado, corrigimos. O risco de não ter retorno é praticamente zero.</p>
         </div>
       </div>
     </div>
@@ -1088,114 +1428,235 @@
 </section>
 
 <!-- SLIDE 10: INVESTIMENTO -->
-<section class="slide" id="slide-10">
+<section class="slide visible" id="slide-10">
   <div class="slide-inner">
     <div class="slide-num">10 &nbsp; Investimento</div>
-    <h2>Tudo junto,<br>pronto para crescer</h2>
+    <h2 spellcheck="false">Um investimento<br>que se paga na<br><em>primeira viagem fechada.</em></h2>
     <div class="accent-line"></div>
-    <div class="invest-layout">
-      <div class="invest-left">
-        <div class="invest-price-label">Implementação Notion Board</div>
-        <div class="invest-price" style="font-size:36px;color:var(--stone);">A definir</div>
-        <div class="invest-note">Sistema completo personalizado para a VeM</div>
-        <ul class="invest-includes" style="list-style:none;">
-          <li><span class="check">✓</span> Workspace construído do zero</li>
-          <li><span class="check">✓</span> 6 módulos integrados</li>
-          <li><span class="check">✓</span> Identidade visual personalizada</li>
-          <li><span class="check">✓</span> Walkthrough gravado</li>
-          <li><span class="check">✓</span> Documentação completa</li>
-          <li><span class="check">✓</span> 7 dias de ajustes pós-entrega</li>
-        </ul>
+
+    <!-- Case label -->
+    <div style="display:inline-flex;align-items:center;gap:10px;padding:8px 20px;border:1px solid var(--terracotta);margin-bottom:40px;">
+      <span style="width:8px;height:8px;border-radius:50%;background:var(--terracotta);display:inline-block;"></span>
+      <span style="font-size:11px;letter-spacing:0.18em;text-transform:uppercase;color:var(--terracotta);font-weight:500;">Condição especial — 1º case de implantação</span>
+    </div>
+
+    <!-- Main price block -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0;border:1px solid var(--border);">
+      <!-- Left: Breakdown -->
+      <div style="padding:48px;border-right:1px solid var(--border);">
+        <div class="label" style="margin-bottom:28px;">O que está incluído</div>
+        <div style="display:flex;flex-direction:column;gap:20px;">
+          <div style="padding-bottom:20px;border-bottom:1px solid var(--border);">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
+              <span style="font-family:'Cormorant Garamond',serif;font-size:17px;">CRM Inteligente Tomik</span>
+              <span style="font-family:'Cormorant Garamond',serif;font-size:15px;color:var(--stone);text-decoration:line-through;">R$ 1.800</span>
+            </div>
+            <div style="font-size:12px;color:var(--stone);font-weight:300;line-height:1.6;">Configuração completa · Agentes de IA · Integrações · Funil · 30d suporte</div>
+          </div>
+          <div style="padding-bottom:20px;border-bottom:1px solid var(--border);">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
+              <span style="font-family:'Cormorant Garamond',serif;font-size:17px;">Notion Board Personalizado</span>
+              <span style="font-family:'Cormorant Garamond',serif;font-size:15px;color:var(--stone);text-decoration:line-through;">R$ 1.997</span>
+            </div>
+            <div style="font-size:12px;color:var(--stone);font-weight:300;line-height:1.6;">6 módulos · Databases · Automações · Walkthrough · Documentação · 7d ajustes</div>
+          </div>
+          <div>
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
+              <span style="font-family:'Cormorant Garamond',serif;font-size:15px;color:var(--stone);">Valor de mercado</span>
+              <span style="font-family:'Cormorant Garamond',serif;font-size:15px;color:var(--stone);text-decoration:line-through;">R$ 3.797</span>
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="invest-right">
-        <div class="invest-price-label-light">Implantação CRM Tomik</div>
-        <div class="invest-price-light" style="font-size:36px;">A definir</div>
-        <div class="invest-note-light">Gestão inteligente de leads com IA</div>
-        <ul class="invest-includes-light" style="list-style:none;">
-          <li><span class="check-light">✓</span> Diagnóstico e configuração</li>
-          <li><span class="check-light">✓</span> Integração WhatsApp + redes</li>
-          <li><span class="check-light">✓</span> Agentes de IA configurados</li>
-          <li><span class="check-light">✓</span> Funil personalizado</li>
-          <li><span class="check-light">✓</span> Treinamento do time</li>
-          <li><span class="check-light">✓</span> 30 dias de suporte</li>
-        </ul>
-        <button class="cta-btn" style="margin-top:24px;width:100%;text-align:center;">Quero começar →</button>
+
+      <!-- Right: Price highlight -->
+      <div style="padding:48px;background:var(--ink);color:var(--cream);display:flex;flex-direction:column;justify-content:space-between;">
+        <div>
+          <div style="font-size:11px;letter-spacing:0.2em;text-transform:uppercase;color:rgba(245,240,232,0.35);margin-bottom:16px;">Seu investimento</div>
+          <div style="font-family:'Cormorant Garamond',serif;font-size:72px;font-weight:300;color:var(--cream);line-height:1;">R$<br>2.500</div>
+          <div style="font-size:13px;color:rgba(245,240,232,0.45);margin-top:8px;font-weight:300;">à vista · ou 3× de R$ 833</div>
+          <div style="margin-top:24px;padding:16px;background:rgba(181,113,74,0.15);border-left:2px solid var(--terracotta);">
+            <div style="font-size:12px;color:var(--terracotta);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px;">Você economiza</div>
+            <div style="font-family:'Cormorant Garamond',serif;font-size:28px;color:var(--cream);font-weight:300;">R$ 1.297 <span style="font-size:16px;opacity:0.5;">(34% off)</span></div>
+          </div>
+        </div>
+        <div style="margin-top:28px;">
+          <div style="font-size:11px;color:rgba(245,240,232,0.25);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:12px;">Contrapartida</div>
+          <div style="font-size:13px;color:rgba(245,240,232,0.6);font-weight:300;line-height:1.7;">✓ &nbsp;Autorização para uso como case<br>✓ &nbsp;Depoimento ao final da implantação<br>✓ &nbsp;Participação no processo de refinamento</div>
+        </div>
+        <div style="margin-top:20px;padding:16px;border:1px solid rgba(245,240,232,0.1);border-top:2px solid var(--terracotta);">
+          <div style="font-size:10px;color:var(--terracotta);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:8px;">Manutenção mensal — após implantação</div>
+          <div style="font-family:'Cormorant Garamond',serif;font-size:26px;font-weight:300;color:var(--cream);">R$ 200<span style="font-size:14px;opacity:0.45;">/mês</span></div>
+          <div style="font-size:11px;color:rgba(245,240,232,0.45);font-weight:300;margin-top:4px;line-height:1.6;">Assinatura da plataforma Tomik CRM<br>Inclui suporte e ajustes de funil</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Payment note -->
+    <div style="margin-top:20px;display:flex;gap:32px;flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="font-size:14px;">💳</span>
+        <span style="font-size:13px;color:var(--stone);font-weight:300;">Cartão em até 3× sem juros</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="font-size:14px;">⚡</span>
+        <span style="font-size:13px;color:var(--stone);font-weight:300;">Pix à vista com início imediato</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="font-size:14px;">🔒</span>
+        <span style="font-size:13px;color:var(--stone);font-weight:300;">50% no início · 50% na entrega</span>
+      </div>
+    </div>
+
+    <!-- Custos recorrentes -->
+    <div style="margin-top:28px;padding:24px 32px;border:1px solid var(--border);background:var(--warm-white);">
+      <div style="font-size:10px;letter-spacing:0.2em;text-transform:uppercase;color:var(--stone);font-weight:500;margin-bottom:20px;">Custos operacionais mensais — após a implantação</div>
+      <div style="display:grid;grid-template-columns:1fr 1px 1fr 1px 1fr;gap:0;align-items:start;">
+        <div style="padding-right:28px;">
+          <div style="font-family:'Cormorant Garamond',serif;font-size:20px;font-weight:300;color:var(--ink);margin-bottom:6px;">Notion Plus</div>
+          <div style="font-size:12px;color:var(--stone);font-weight:300;line-height:1.65;">~R$ 55 / membro / mês<br>2 pessoas: ~R$ 110/mês<br>3 pessoas: ~R$ 165/mês</div>
+          <div style="margin-top:8px;font-size:11px;color:var(--sage);font-weight:400;">✓ Plano gratuito disponível para começar</div>
+        </div>
+        <div style="background:var(--border);height:100%;min-height:80px;"></div>
+        <div style="padding:0 28px;">
+          <div style="font-family:'Cormorant Garamond',serif;font-size:20px;font-weight:300;color:var(--ink);margin-bottom:6px;">Taxa de Plataforma</div>
+            <div style="font-size:12px;color:var(--stone);font-weight:300;line-height:1.65;">Assinatura Tomik CRM · R$200/mês<br>Gestão, suporte e ajustes de funil<br><span style="color:var(--terracotta);font-weight:400;">Inclusa no plano mensal</span></div>
+        </div>
+        <div style="background:var(--border);height:100%;min-height:80px;"></div>
+        <div style="padding-left:28px;">
+          <div style="padding:12px 16px;background:rgba(92,107,90,0.07);border-left:2px solid var(--sage);">
+            <div style="font-size:10px;color:var(--sage);letter-spacing:0.12em;text-transform:uppercase;margin-bottom:6px;">Recomendação</div>
+            <div style="font-size:12px;color:var(--stone);font-weight:300;line-height:1.65;">Começar no plano gratuito do Notion e migrar para Plus conforme o time cresce. O CRM Tomik já está incluso na taxa mensal de manutenção.</div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
 </section>
 
 <!-- SLIDE 11: PRÓXIMOS PASSOS -->
-<section class="slide slide-dark" id="slide-11">
+<section class="slide slide-dark visible" id="slide-11">
   <div class="slide-inner">
     <div class="slide-num">11 &nbsp; Próximos passos</div>
-    <h2>O pior cenário:<br>um sistema funcionando<br><em>em 5 semanas.</em></h2>
+    <h2 spellcheck="false">O pior cenário:<br>um sistema funcionando<br><em>em 5 semanas.</em></h2>
     <div class="accent-line"></div>
-    <p class="body-text" style="max-width:560px;margin-bottom:48px;">O melhor cenário: a VeM transforma completamente a forma como opera, converte e cria conteúdo — e nunca mais volta ao caos.</p>
+    <p class="body-text" style="max-width:560px;margin-bottom:48px;" spellcheck="false">O melhor cenário: a VeM transforma completamente a forma como opera, converte e cria conteúdo e nunca mais volta ao caos.</p>
     <div class="three-col">
       <div>
         <div style="font-family:'Cormorant Garamond',serif;font-size:40px;font-weight:300;color:var(--terracotta);margin-bottom:12px;">01</div>
         <div class="accent-line" style="background:rgba(245,240,232,0.15);width:24px;"></div>
-        <h3 style="color:var(--cream);font-size:17px;">Aprovação da proposta</h3>
-        <p class="body-text" style="font-size:13px;">Confirmação do escopo e assinatura do contrato.</p>
+        <h3 style="color:var(--cream);font-size:17px;" spellcheck="false">Aprovação da proposta</h3>
+        <p class="body-text" style="font-size:13px;" spellcheck="false">Confirmação do escopo e assinatura do contrato.</p>
       </div>
       <div>
         <div style="font-family:'Cormorant Garamond',serif;font-size:40px;font-weight:300;color:var(--terracotta);margin-bottom:12px;">02</div>
         <div class="accent-line" style="background:rgba(245,240,232,0.15);width:24px;"></div>
-        <h3 style="color:var(--cream);font-size:17px;">Kickoff em até 48h</h3>
-        <p class="body-text" style="font-size:13px;">Reunião de alinhamento e início imediato da implantação.</p>
+        <h3 style="color:var(--cream);font-size:17px;" spellcheck="false">Kickoff em até 48h</h3>
+        <p class="body-text" style="font-size:13px;" spellcheck="false">Reunião de alinhamento e início imediato da implantação.</p>
       </div>
       <div>
         <div style="font-family:'Cormorant Garamond',serif;font-size:40px;font-weight:300;color:var(--terracotta);margin-bottom:12px;">03</div>
         <div class="accent-line" style="background:rgba(245,240,232,0.15);width:24px;"></div>
-        <h3 style="color:var(--cream);font-size:17px;">Sistema entregue</h3>
-        <p class="body-text" style="font-size:13px;">CRM ativo + Notion funcionando. VeM pronta para escalar.</p>
+        <h3 style="color:var(--cream);font-size:17px;" spellcheck="false">Sistema entregue</h3>
+        <p class="body-text" style="font-size:13px;" spellcheck="false">CRM ativo + Notion funcionando. VeM pronta para escalar.</p>
       </div>
     </div>
     <div style="margin-top:56px;padding-top:40px;border-top:1px solid rgba(245,240,232,0.1);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:24px;">
       <div>
-        <div class="label" style="color:rgba(245,240,232,0.35);margin-bottom:8px;">Dúvidas? Entre em contato</div>
-        <div style="font-family:'Cormorant Garamond',serif;font-size:18px;color:rgba(245,240,232,0.7);">[Seu contato aqui]</div>
+        <div class="label" style="color:rgba(245,240,232,0.35);margin-bottom:8px;">Dúvidas? Entre em contato <span style="font-size:9px;opacity:0.5;letter-spacing:0.05em;">(clique para editar)</span></div>
+        <div style="display:flex;flex-direction:column;gap:6px;margin-top:4px;">
+        <div class="contact-field" style="font-family:'Cormorant Garamond',serif;font-size:18px;color:rgba(245,240,232,0.8);border-bottom:1px solid rgba(245,240,232,0.15);padding-bottom:4px;min-width:260px;" spellcheck="false">Lara Barroso — (31) 99435-7644&nbsp;</div>
+        <div class="contact-field" style="font-family:'Cormorant Garamond',serif;font-size:16px;color:rgba(245,240,232,0.5);" spellcheck="false">@itslittlelara</div>
       </div>
-      <button class="cta-btn">Aprovar proposta →</button>
+      </div>
+      <a class="cta-btn" id="whatsappBtn" href="https://wa.me/5531994357644?text=Ol%C3%A1%21+Quero+aprovar+a+proposta+de+CRM+%2B+Notion+para+a+VeM." target="_blank" style="text-decoration:none;">Aprovar proposta →</a>
     </div>
   </div>
 </section>
 
-<footer>
-  Vidas em Movimento · Proposta Confidencial · 2025
+
+<!-- EDIT TOOLBAR -->
+<div class="edit-toolbar" id="editToolbar">
+  <div class="edit-dot"></div>
+  <span class="toolbar-label">Proposta VeM</span>
+  <div class="toolbar-divider"></div>
+  <button class="btn-edit" id="btnEdit" onclick="toggleEdit()">✏️ Editar</button>
+  <div class="toolbar-divider"></div>
+  <button class="btn-save" onclick="downloadHTML()">⬇ Baixar HTML</button>
+</div>
+
+<footer spellcheck="false">
+  Vidas em Movimento · Proposta Confidencial · 2026
 </footer>
 
 <script>
   const slides = document.querySelectorAll('.slide');
   const navDotsContainer = document.getElementById('navDots');
-
-  // Create nav dots
   slides.forEach((_, i) => {
     const dot = document.createElement('button');
     dot.classList.add('nav-dot');
     if (i === 0) dot.classList.add('active');
-    dot.setAttribute('aria-label', `Slide ${i + 1}`);
-    dot.addEventListener('click', () => {
-      slides[i].scrollIntoView({ behavior: 'smooth' });
-    });
+    dot.setAttribute('aria-label', 'Slide ' + (i+1));
+    dot.addEventListener('click', () => slides[i].scrollIntoView({ behavior: 'smooth' }));
     navDotsContainer.appendChild(dot);
   });
-
-  const dots = document.querySelectorAll('.nav-dot');
-
-  // Intersection observer for animations + active dot
+  const dots = () => document.querySelectorAll('.nav-dot');
   const observer = new IntersectionObserver((entries) => {
     entries.forEach(entry => {
       if (entry.isIntersecting) {
         entry.target.classList.add('visible');
         const idx = Array.from(slides).indexOf(entry.target);
-        dots.forEach((d, i) => d.classList.toggle('active', i === idx));
+        dots().forEach((d, i) => d.classList.toggle('active', i === idx));
       }
     });
   }, { threshold: 0.2 });
-
   slides.forEach(slide => observer.observe(slide));
+
+  const EDITABLE = 'h1, h2, h3, .funnel-step, .contact-field, .body-text, .cover-meta, .cover-tagline, .cover-detail, .timeline-title, .timeline-body, .timeline-step, .card-number, .invest-price, .invest-price-light, .invest-note, .invest-note-light, .invest-price-label, .invest-price-label-light, .badge, .result-num, .highlight-box p, td, th, .pill, .styled-list li span, footer';
+
+  let editMode = false;
+
+  function toggleEdit() {
+    editMode = !editMode;
+    const btn = document.getElementById('btnEdit');
+    btn.classList.toggle('active', editMode);
+    btn.textContent = editMode ? '✅ Editando' : '✏️ Editar';
+    document.body.classList.toggle('edit-mode', editMode);
+    document.querySelectorAll(EDITABLE).forEach(el => {
+      if (el.closest('.edit-toolbar') || el.closest('.nav') || el.tagName === 'BUTTON') return;
+      editMode ? el.setAttribute('contenteditable','true') : el.removeAttribute('contenteditable');
+      if (editMode) el.setAttribute('spellcheck','false');
+    });
+    if (editMode) showToast('Clique em qualquer texto para editar');
+  }
+
+  function downloadHTML() {
+    document.querySelectorAll('.slide').forEach(s => s.classList.add('visible'));
+    const wasEditing = editMode;
+    if (wasEditing) document.body.classList.remove('');
+    const rawHTML = document.documentElement.outerHTML;
+    if (wasEditing) document.body.classList.add('');
+    let html = '<!DOCTYPE html>\n' + rawHTML;
+    html = html.replace(/\bedit-mode\b/g, '');
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'proposta-vem.html';
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    setTimeout(() => { document.body.removeChild(link); URL.revokeObjectURL(url); }, 300);
+    showToast('✓ Salvo com todas as suas edições!');
+  }
+
+  function showToast(msg) {
+    let t = document.getElementById('_toast');
+    if (!t) { t = document.createElement('div'); t.id = '_toast'; t.style.cssText = 'position:fixed;top:76px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--cream);padding:9px 22px;border-radius:100px;font-size:12px;letter-spacing:0.08em;z-index:999;opacity:0;transition:opacity 0.3s;pointer-events:none;font-family:DM Sans,sans-serif;border:1px solid rgba(255,255,255,0.1);white-space:nowrap;'; document.body.appendChild(t); }
+    t.textContent = msg; t.style.opacity = '1';
+    setTimeout(() => t.style.opacity = '0', 2600);
+  }
 </script>
-</body>
-</html>
+
+
+<div id="_toast" style="position: fixed; top: 76px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--cream); padding: 9px 22px; border-radius: 100px; font-size: 12px; letter-spacing: 0.08em; z-index: 999; opacity: 0; transition: opacity 0.3s; pointer-events: none; font-family: &quot;DM Sans&quot;, sans-serif; border: 1px solid rgba(255, 255, 255, 0.1); white-space: nowrap;">✓ Salvo com todas as suas edições!</div></body></html>
