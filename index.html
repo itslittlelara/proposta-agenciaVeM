@@ -1631,23 +1631,44 @@
   }
 
   function downloadHTML() {
+    // Make all slides visible in export
     document.querySelectorAll('.slide').forEach(s => s.classList.add('visible'));
+
+    // Temporarily remove edit-mode class from body only (not from script/CSS)
     const wasEditing = editMode;
-    if (wasEditing) document.body.classList.remove('');
-    const rawHTML = document.documentElement.outerHTML;
-    if (wasEditing) document.body.classList.add('');
-    let html = '<!DOCTYPE html>\n' + rawHTML;
-    html = html.replace(/\bedit-mode\b/g, '');
-    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'proposta-vem.html';
-    link.style.display = 'none';
-    document.body.appendChild(link);
-    link.click();
-    setTimeout(() => { document.body.removeChild(link); URL.revokeObjectURL(url); }, 300);
-    showToast('✓ Salvo com todas as suas edições!');
+    if (wasEditing) document.body.classList.remove('edit-mode');
+
+    // Capture current DOM with all user edits
+    let html = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+
+    // Restore body class immediately
+    if (wasEditing) document.body.classList.add('edit-mode');
+
+    // Remove edit-mode only from <body ...> tag, not from script or CSS
+    html = html.replace(/(<body[^>]*?)\s*\bedit-mode\b([^>]*?>)/, '$1$2');
+
+    // Try download — with fallback to new tab if browser blocks blob URL
+    try {
+      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'proposta-vem.html';
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.click();
+      setTimeout(() => {
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+      }, 300);
+      showToast('✓ Salvo com todas as suas edições!');
+    } catch(e) {
+      // Fallback: open in new tab so user can Cmd+S to save
+      const tab = window.open('', '_blank');
+      tab.document.write(html);
+      tab.document.close();
+      showToast('Aba aberta — use Cmd+S para salvar!');
+    }
   }
 
   function showToast(msg) {
