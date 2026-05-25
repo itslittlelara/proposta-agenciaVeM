@@ -1,325 +1,8 @@
 <!DOCTYPE html>
 <html lang="pt-BR"><head>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-    <script>
-  // Nav dots
-  const slides = document.querySelectorAll('.slide');
-  const navDotsContainer = document.getElementById('navDots');
-  slides.forEach((_, i) => {
-    const dot = document.createElement('button');
-    dot.classList.add('nav-dot');
-    if (i === 0) dot.classList.add('active');
-    dot.setAttribute('aria-label', 'Slide ' + (i+1));
-    dot.addEventListener('click', () => slides[i].scrollIntoView({ behavior: 'smooth' }));
-    navDotsContainer.appendChild(dot);
-  });
-  const getDots = () => document.querySelectorAll('.nav-dot');
-  const observer = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        entry.target.classList.add('visible');
-        const idx = Array.from(slides).indexOf(entry.target);
-        getDots().forEach((d, i) => d.classList.toggle('active', i === idx));
-      }
-    });
-  }, { threshold: 0.2 });
-  slides.forEach(slide => observer.observe(slide));
-</script>
-    <script>
-      (function() {
-        const originalConsole = window.console;
-        window.console = {
-          log: (...args) => {
-            originalConsole.log(...args);
-            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
-          },
-          error: (...args) => {
-            originalConsole.error(...args);
-            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
-          },
-          warn: (...args) => {
-            originalConsole.warn(...args);
-            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
-          }
-        };
-
-        let requestId = 0;
-        let callbacksMap = new Map();
-        let streamControllers = new Map();
-        
-        window.claude = {
-          complete: (prompt) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
-            });
-          }
-        };
-
-        window.storage = {
-          get: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
-            });
-          },
-          set: (key, value, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
-            });
-          },
-          delete: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
-            });
-          },
-          list: (prefix, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
-            });
-          }
-        };
-
-        let pendingBlobs = new Map();
-        URL.createObjectURL = (blob) => {
-          // Store the blob and create an ID and URL for it
-          const blobId = `blob-${Date.now()}-${Math.random()}`;
-          pendingBlobs.set(blobId, blob);
-          return `blob-request://${blobId}`;
-        };
-
-        URL.revokeObjectURL = (url) => {
-          // Remove the blob from our store
-          const blobId = url.replace("blob-request://", "");
-          pendingBlobs.delete(blobId);
-        };
-
-        const getBlobFromURL = (url) => {
-          const blobId = url.replace("blob-request://", "");
-          return pendingBlobs.get(blobId);
-        };
-
-        // Override global fetch with streaming support
-        window.fetch = (url, init = {}) => {
-          return new Promise((resolve, reject) => {
-            const id = requestId++;
-            const channelId = `fetch-${id}-${Date.now()}`;
-            
-            callbacksMap.set(id, { 
-              resolve: (response) => {
-                // Create a ReadableStream for the response body
-                const stream = new ReadableStream({
-                  start(controller) {
-                    streamControllers.set(channelId, controller);
-                  },
-                  cancel() {
-                    streamControllers.delete(channelId);
-                  }
-                });
-                
-                // Create and return the Response with the stream
-                resolve(new Response(stream, {
-                  status: response.status,
-                  statusText: response.statusText,
-                  headers: response.headers
-                }));
-              },
-              reject,
-              channelId
-            });
-            
-            window.parent.postMessage({
-              type: 'proxyFetch',
-              id,
-              url,
-              init,
-              channelId
-            }, '*');
-          });
-        };
-
-        window.addEventListener('message', async (event) => {
-          if (event.data.type === 'takeScreenshot') {
-            const rootElement = document.getElementById('artifacts-component-root-html');
-            if (!rootElement) {
-              window.parent.postMessage({
-                type: 'screenshotError',
-                error: new Error('Root element not found'),
-              }, '*');
-              return;
-            }
-            // Catch CDN load failures (htmlToImage undefined) and toPng errors
-            // so the parent always gets a response instead of hanging forever.
-            try {
-              const screenshot = await htmlToImage.toPng(rootElement, {
-                imagePlaceholder:
-                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
-              });
-              window.parent.postMessage({
-                type: 'screenshotData',
-                data: screenshot,
-              }, '*');
-            } catch (err) {
-              window.parent.postMessage({
-                type: 'screenshotError',
-                error: err instanceof Error ? err : new Error(String(err)),
-              }, '*');
-            }
-          } else if (event.data.type === 'claudeComplete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.completion);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'proxyFetchResponse') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-              callbacksMap.delete(event.data.id);
-            } else {
-              // Initial response with headers, status, etc.
-              callback.resolve({
-                status: event.data.status,
-                statusText: event.data.statusText,
-                headers: event.data.headers
-              });
-              // Don't delete the callback yet if streaming
-              if (!event.data.body) {
-                callbacksMap.delete(event.data.id);
-              }
-            }
-          } else if (event.data.type === 'proxyFetchStream') {
-            // Handle streaming data chunks
-            const controller = streamControllers.get(event.data.channelId);
-            if (controller) {
-              if (event.data.error) {
-                controller.error(new Error(event.data.error));
-                streamControllers.delete(event.data.channelId);
-              } else if (event.data.done) {
-                controller.close();
-                streamControllers.delete(event.data.channelId);
-                // Clean up the callback
-                const callback = Array.from(callbacksMap.entries()).find(
-                  ([_, value]) => value.channelId === event.data.channelId
-                );
-                if (callback) {
-                  callbacksMap.delete(callback[0]);
-                }
-              } else if (event.data.chunk) {
-                controller.enqueue(new Uint8Array(event.data.chunk));
-              }
-            }
-          } else if (event.data.type === 'storageGet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageSet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageDelete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageList') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          }
-        });
-
-        window.addEventListener('click', (event) => {
-          const isEl = event.target instanceof HTMLElement;
-          if (!isEl) return;
     
-          // find ancestor links
-          const linkEl = event.target.closest("a");
-          if (!linkEl || !linkEl.href) return;
     
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
-          if (linkEl.href.startsWith("blob-request:")) {
-            const blob = getBlobFromURL(linkEl.href);
-            if (!blob) return;
-            void blob.arrayBuffer().then((data) => {
-              window.parent.postMessage({
-                type: "downloadFile",
-                filename: linkEl.download,
-                data,
-                mimeType: blob.type || "application/octet-stream",
-              });
-            });
-          } else if (linkEl.href.startsWith("data:")) {
-            const [header, base64Data] = linkEl.href.split(",");
-            const mimeMatch = header.match(/data:([^;]+)/);
-            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
-            const binaryString = atob(base64Data);
-            const data = Uint8Array.from(binaryString, (c) =>
-              c.charCodeAt(0),
-            ).buffer;
-            window.parent.postMessage({
-              type: "downloadFile",
-              filename: linkEl.download,
-              data,
-              mimeType,
-            });
-          } else {
-            let linkUrl;
-            try {
-              linkUrl = new URL(linkEl.href);
-            } catch (error) {
-              return;
-            }
-    
-            if (linkUrl.hostname === window.location.hostname) return;
-      
-            window.parent.postMessage({
-              type: 'openExternal',
-              href: linkEl.href,
-            }, '*');
-          }
-      });
-
-        const originalOpen = window.open;
-        window.open = function (url) {
-          window.parent.postMessage({
-            type: "openExternal",
-            href: url,
-          }, "*");
-        };
-
-        window.addEventListener('error', (event) => {
-          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
-        });
-      })();
-    </script>
   
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -934,6 +617,8 @@
     .invest-left, .invest-right { border-right: none; }
     .invest-layout { border: none; gap: 16px; }
   }
+
+
 </style>
 </head>
 <body id="artifacts-component-root-html" class="">
@@ -1418,7 +1103,7 @@
     <!-- Case label -->
     <div style="display:inline-flex;align-items:center;gap:10px;padding:8px 20px;border:1px solid var(--terracotta);margin-bottom:40px;">
       <span style="width:8px;height:8px;border-radius:50%;background:var(--terracotta);display:inline-block;"></span>
-      <span style="font-size:11px;letter-spacing:0.18em;text-transform:uppercase;color:var(--terracotta);font-weight:500;">Condição especial — 1º case de implantação</span>
+      <span style="font-size:11px;letter-spacing:0.18em;text-transform:uppercase;color:var(--terracotta);font-weight:500;">Condição especial — 2 em 1</span>
     </div>
 
     <!-- Main price block -->
@@ -1429,10 +1114,17 @@
         <div style="display:flex;flex-direction:column;gap:20px;">
           <div style="padding-bottom:20px;border-bottom:1px solid var(--border);">
             <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
-              <span style="font-family:'Cormorant Garamond',serif;font-size:17px;">CRM Inteligente Tomik</span>
-              <span style="font-family:'Cormorant Garamond',serif;font-size:15px;color:var(--stone);text-decoration:line-through;">R$ 1.800</span>
+              <span style="font-family:'Cormorant Garamond',serif;font-size:17px;">Assinatura Vitalícia Tomik CRM</span>
+              <span style="font-family:'Cormorant Garamond',serif;font-size:15px;color:var(--stone);text-decoration:line-through;">R$ 2.500</span>
             </div>
-            <div style="font-size:12px;color:var(--stone);font-weight:300;line-height:1.6;">Configuração completa · Agentes de IA · Integrações · Funil · 30d suporte</div>
+            <div style="font-size:12px;color:var(--stone);font-weight:300;line-height:1.6;">Acesso vitalício à plataforma · Sem mensalidade recorrente · Atualizações inclusas</div>
+          </div>
+          <div style="padding-bottom:20px;border-bottom:1px solid var(--border);">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
+              <span style="font-family:'Cormorant Garamond',serif;font-size:17px;">Implementação do Sistema Automatizado</span>
+              <span style="font-family:'Cormorant Garamond',serif;font-size:15px;color:var(--stone);text-decoration:line-through;">R$ 2.000</span>
+            </div>
+            <div style="font-size:12px;color:var(--stone);font-weight:300;line-height:1.6;">Configuração completa · Agentes de IA · Integrações · Funil personalizado · 30d suporte</div>
           </div>
           <div style="padding-bottom:20px;border-bottom:1px solid var(--border);">
             <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
@@ -1441,10 +1133,17 @@
             </div>
             <div style="font-size:12px;color:var(--stone);font-weight:300;line-height:1.6;">6 módulos · Databases · Automações · Walkthrough · Documentação · 7d ajustes</div>
           </div>
+          <div style="padding-bottom:20px;border-bottom:1px solid var(--border);">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
+              <span style="font-family:'Cormorant Garamond',serif;font-size:17px;">Consultoria Notion</span>
+              <span style="font-family:'Cormorant Garamond',serif;font-size:15px;color:var(--stone);text-decoration:line-through;">R$ 997</span>
+            </div>
+            <div style="font-size:12px;color:var(--stone);font-weight:300;line-height:1.6;">Diagnóstico personalizado + solução sob medida em 2 sessões (Raio-X + Rota) · Profissional certificado pela Notion</div>
+          </div>
           <div>
             <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
               <span style="font-family:'Cormorant Garamond',serif;font-size:15px;color:var(--stone);">Valor de mercado</span>
-              <span style="font-family:'Cormorant Garamond',serif;font-size:15px;color:var(--stone);text-decoration:line-through;">R$ 3.797</span>
+              <span style="font-family:'Cormorant Garamond',serif;font-size:15px;color:var(--stone);text-decoration:line-through;">R$ 7.494</span>
             </div>
           </div>
         </div>
@@ -1458,7 +1157,7 @@
           <div style="font-size:13px;color:rgba(245,240,232,0.45);margin-top:8px;font-weight:300;">à vista · ou 3× de R$ 833</div>
           <div style="margin-top:24px;padding:16px;background:rgba(181,113,74,0.15);border-left:2px solid var(--terracotta);">
             <div style="font-size:12px;color:var(--terracotta);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px;">Você economiza</div>
-            <div style="font-family:'Cormorant Garamond',serif;font-size:28px;color:var(--cream);font-weight:300;">R$ 1.297 <span style="font-size:16px;opacity:0.5;">(34% off)</span></div>
+            <div style="font-family:'Cormorant Garamond',serif;font-size:28px;color:var(--cream);font-weight:300;">R$ 4.994 <span style="font-size:16px;opacity:0.5;">(67% off)</span></div>
           </div>
         </div>
         <div style="margin-top:28px;">
@@ -1466,9 +1165,9 @@
           <div style="font-size:13px;color:rgba(245,240,232,0.6);font-weight:300;line-height:1.7;">✓ &nbsp;Autorização para uso como case<br>✓ &nbsp;Depoimento ao final da implantação<br>✓ &nbsp;Participação no processo de refinamento</div>
         </div>
         <div style="margin-top:20px;padding:16px;border:1px solid rgba(245,240,232,0.1);border-top:2px solid var(--terracotta);">
-          <div style="font-size:10px;color:var(--terracotta);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:8px;">Manutenção mensal — após implantação</div>
-          <div style="font-family:'Cormorant Garamond',serif;font-size:26px;font-weight:300;color:var(--cream);">R$ 200<span style="font-size:14px;opacity:0.45;">/mês</span></div>
-          <div style="font-size:11px;color:rgba(245,240,232,0.45);font-weight:300;margin-top:4px;line-height:1.6;">Assinatura da plataforma Tomik CRM<br>Inclui suporte e ajustes de funil</div>
+          <div style="font-size:10px;color:var(--terracotta);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:8px;">Manutenção — após implantação</div>
+          <div style="font-family:'Cormorant Garamond',serif;font-size:26px;font-weight:300;color:var(--cream);">R$ 250<span style="font-size:14px;opacity:0.45;">/mês*</span></div>
+          <div style="font-size:11px;color:rgba(245,240,232,0.45);font-weight:300;margin-top:4px;line-height:1.6;">Se precisar de manutenção após entrega<br>Ajustes de funil, automações e suporte</div>
         </div>
       </div>
     </div>
@@ -1486,30 +1185,6 @@
       <div style="display:flex;align-items:center;gap:8px;">
         <span style="font-size:14px;">🔒</span>
         <span style="font-size:13px;color:var(--stone);font-weight:300;">50% no início · 50% na entrega</span>
-      </div>
-    </div>
-
-    <!-- Custos recorrentes -->
-    <div style="margin-top:28px;padding:24px 32px;border:1px solid var(--border);background:var(--warm-white);">
-      <div style="font-size:10px;letter-spacing:0.2em;text-transform:uppercase;color:var(--stone);font-weight:500;margin-bottom:20px;">Custos operacionais mensais — após a implantação</div>
-      <div style="display:grid;grid-template-columns:1fr 1px 1fr 1px 1fr;gap:0;align-items:start;">
-        <div style="padding-right:28px;">
-          <div style="font-family:'Cormorant Garamond',serif;font-size:20px;font-weight:300;color:var(--ink);margin-bottom:6px;">Notion Plus</div>
-          <div style="font-size:12px;color:var(--stone);font-weight:300;line-height:1.65;">~R$ 55 / membro / mês<br>2 pessoas: ~R$ 110/mês<br>3 pessoas: ~R$ 165/mês</div>
-          <div style="margin-top:8px;font-size:11px;color:var(--sage);font-weight:400;">✓ Plano gratuito disponível para começar</div>
-        </div>
-        <div style="background:var(--border);height:100%;min-height:80px;"></div>
-        <div style="padding:0 28px;">
-          <div style="font-family:'Cormorant Garamond',serif;font-size:20px;font-weight:300;color:var(--ink);margin-bottom:6px;">Taxa de Plataforma</div>
-            <div style="font-size:12px;color:var(--stone);font-weight:300;line-height:1.65;">Assinatura Tomik CRM · R$200/mês<br>Gestão, suporte e ajustes de funil<br><span style="color:var(--terracotta);font-weight:400;">Inclusa no plano mensal</span></div>
-        </div>
-        <div style="background:var(--border);height:100%;min-height:80px;"></div>
-        <div style="padding-left:28px;">
-          <div style="padding:12px 16px;background:rgba(92,107,90,0.07);border-left:2px solid var(--sage);">
-            <div style="font-size:10px;color:var(--sage);letter-spacing:0.12em;text-transform:uppercase;margin-bottom:6px;">Recomendação</div>
-            <div style="font-size:12px;color:var(--stone);font-weight:300;line-height:1.65;">Começar no plano gratuito do Notion e migrar para Plus conforme o time cresce. O CRM Tomik já está incluso na taxa mensal de manutenção.</div>
-          </div>
-        </div>
       </div>
     </div>
   </div>
@@ -1554,8 +1229,33 @@
     </div>
   </div>
 </section>
+
 <footer>
   Vidas em Movimento · Proposta Confidencial · 2026
 </footer>
-</body></html>
-</body></html>
+
+
+<script>
+  const slides = document.querySelectorAll('.slide');
+  const navDotsContainer = document.getElementById('navDots');
+  slides.forEach((_, i) => {
+    const dot = document.createElement('button');
+    dot.classList.add('nav-dot');
+    if (i === 0) dot.classList.add('active');
+    dot.setAttribute('aria-label', 'Slide ' + (i + 1));
+    dot.addEventListener('click', () => slides[i].scrollIntoView({ behavior: 'smooth' }));
+    navDotsContainer.appendChild(dot);
+  });
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+        const idx = Array.from(slides).indexOf(entry.target);
+        document.querySelectorAll('.nav-dot').forEach((d, i) => d.classList.toggle('active', i === idx));
+      }
+    });
+  }, { threshold: 0.2 });
+  slides.forEach(slide => observer.observe(slide));
+</script>
+</body>
+</html>
